@@ -16,17 +16,31 @@
 package com.github.barteksc.pdfviewer;
 
 import android.graphics.Bitmap;
+import android.graphics.Canvas;
 import android.graphics.Color;
 import android.graphics.Matrix;
+import android.graphics.Paint;
 import android.graphics.Rect;
 import android.graphics.RectF;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.Message;
 import android.util.Log;
+import android.util.SparseArray;
 
 import com.github.barteksc.pdfviewer.exception.PageRenderingException;
 import com.github.barteksc.pdfviewer.model.PagePart;
+import com.google.android.gms.vision.Frame;
+import com.google.android.gms.vision.text.Element;
+import com.google.android.gms.vision.text.Line;
+import com.google.android.gms.vision.text.TextBlock;
+import com.google.android.gms.vision.text.TextRecognizer;
+
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.regex.Pattern;
 
 /**
  * A {@link Handler} that will process incoming {@link RenderingTask} messages
@@ -47,14 +61,20 @@ class RenderingHandler extends Handler {
     private Rect roundedRenderBounds = new Rect();
     private Matrix renderMatrix = new Matrix();
     private boolean running = false;
+    TextRecognizer textRecognizer;
+
+    private Map<Integer, List<RectF>> pagesBoundBoxes;
+//    private boolean clearBoundBoxes = false;
 
     RenderingHandler(Looper looper, PDFView pdfView) {
         super(looper);
         this.pdfView = pdfView;
+        textRecognizer = new TextRecognizer.Builder(pdfView.getContext()).build();
+        pagesBoundBoxes = new HashMap<>();
     }
 
-    void addRenderingTask(int page, float width, float height, RectF bounds, boolean thumbnail, int cacheOrder, boolean bestQuality, boolean annotationRendering) {
-        RenderingTask task = new RenderingTask(width, height, bounds, page, thumbnail, cacheOrder, bestQuality, annotationRendering);
+    void addRenderingTask(int page, float width, float height, RectF bounds, boolean thumbnail, int cacheOrder, boolean bestQuality, boolean annotationRendering, String searchWord) {
+        RenderingTask task = new RenderingTask(width, height, bounds, page, thumbnail, cacheOrder, bestQuality, annotationRendering, searchWord);
         Message msg = obtainMessage(MSG_RENDER_TASK, task);
         sendMessage(msg);
     }
@@ -108,9 +128,55 @@ class RenderingHandler extends Handler {
 
         pdfFile.renderPageBitmap(render, renderingTask.page, roundedRenderBounds, renderingTask.annotationRendering);
 
-        return new PagePart(renderingTask.page, render,
-                renderingTask.bounds, renderingTask.thumbnail,
-                renderingTask.cacheOrder);
+        if (renderingTask.thumbnail && !renderingTask.searchWord.isEmpty()) {
+//            if (clearBoundBoxes) {
+//                pagesBoundBoxes.clear();
+//                clearBoundBoxes = false;
+//            }
+            pagesBoundBoxes.put(renderingTask.page, searchWordBoundingBox(renderingTask.searchWord, render));
+        }
+//        } else {
+//            clearBoundBoxes = true;
+//        }
+//        System.out.println("is thumbnail: " + renderingTask.thumbnail + " page: " + renderingTask.page);
+        List<RectF> boundingBoxes = pagesBoundBoxes.get(renderingTask.page);
+        if (boundingBoxes != null) {
+            for (RectF boundBox : boundingBoxes) {
+                highlightBitmap(render, renderingTask.bounds, boundBox);
+            }
+        }
+        return new PagePart(renderingTask.page, render, renderingTask.bounds, renderingTask.thumbnail, renderingTask.cacheOrder);
+    }
+
+    private void highlightBitmap(Bitmap bitmap, RectF bitmapBounds, RectF normalizedBoundingBox) {
+        RectF realBoundBox = new RectF((normalizedBoundingBox.left - bitmapBounds.left) / (bitmapBounds.right - bitmapBounds.left) * bitmap.getWidth(), (normalizedBoundingBox.top - bitmapBounds.top) / (bitmapBounds.bottom - bitmapBounds.top) * bitmap.getHeight(), (normalizedBoundingBox.right - bitmapBounds.left) / (bitmapBounds.right - bitmapBounds.left) * bitmap.getWidth(), (normalizedBoundingBox.bottom - bitmapBounds.top) / (bitmapBounds.bottom - bitmapBounds.top) * bitmap.getHeight());
+        Canvas canvas = new Canvas(bitmap);
+        Paint p = new Paint();
+        p.setStyle(Paint.Style.FILL_AND_STROKE);
+        p.setColor(Color.argb(120, 255, 255, 0));
+        canvas.drawRect(realBoundBox, p);
+    }
+
+    private List<RectF> searchWordBoundingBox(String searchWord, Bitmap image) {
+        List<RectF> boundingBoxes = new ArrayList<>();
+        Frame imageFrame = new Frame.Builder().setBitmap(image).build();
+        SparseArray<TextBlock> textBlocks = textRecognizer.detect(imageFrame);
+        for (int i = 0; i < textBlocks.size(); i++) {
+            TextBlock textBlock = textBlocks.valueAt(i);
+            System.out.println(textBlock.getValue());
+            List<Line> lines = (List<Line>) textBlock.getComponents();
+            for (Line line : lines) {
+                List<Element> elements = (List<Element>) line.getComponents();
+                for (Element element : elements) {
+                    if (Pattern.compile(Pattern.quote(searchWord), Pattern.CASE_INSENSITIVE).matcher(element.getValue()).find()) {
+                        Rect boundBox = element.getBoundingBox();
+                        RectF normalizedBoundBox = new RectF(boundBox.left / (float) image.getWidth(), boundBox.top / (float) image.getHeight(), boundBox.right / (float) image.getWidth(), boundBox.bottom / (float) image.getHeight());
+                        boundingBoxes.add(normalizedBoundBox);
+                    }
+                }
+            }
+        }
+        return boundingBoxes;
     }
 
     private void calculateBounds(int width, int height, RectF pageSliceBounds) {
@@ -147,7 +213,9 @@ class RenderingHandler extends Handler {
 
         boolean annotationRendering;
 
-        RenderingTask(float width, float height, RectF bounds, int page, boolean thumbnail, int cacheOrder, boolean bestQuality, boolean annotationRendering) {
+        String searchWord;
+
+        RenderingTask(float width, float height, RectF bounds, int page, boolean thumbnail, int cacheOrder, boolean bestQuality, boolean annotationRendering, String searchWord) {
             this.page = page;
             this.width = width;
             this.height = height;
@@ -156,6 +224,7 @@ class RenderingHandler extends Handler {
             this.cacheOrder = cacheOrder;
             this.bestQuality = bestQuality;
             this.annotationRendering = annotationRendering;
+            this.searchWord = searchWord;
         }
     }
 }
